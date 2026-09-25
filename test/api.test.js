@@ -902,6 +902,48 @@ function jsonRequest(server, urlPath, payload) {
     assert.strictEqual(outOfRangeResp.status, 400);
     assert.match(JSON.parse(outOfRangeResp.body.toString()).error, /超出原稿页码范围（1～5）/);
 
+    // 无界展开防护：非安全整数区间端点 -> 400（旧版本逐页递增无法前进，会卡住并阻塞其他请求）
+    const unsafePagesBody = multipartBody({
+      text: { pages: '9007199254740992-9007199254740992' },
+      files: [{ field: 'pdf', filename: 'sample.pdf', contentType: 'application/pdf', data: pdfBytes }],
+    }, boundary);
+    const unsafePagesResp = await request(server, 'POST', '/api/reprint', {
+      body: unsafePagesBody,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': unsafePagesBody.length,
+      },
+    });
+    assert.strictEqual(unsafePagesResp.status, 400);
+    assert.match(JSON.parse(unsafePagesResp.body.toString()).error, /超出可精确表示的整数范围/);
+
+    // 远超原稿页数的超大区间 -> 400（在展开页码列表与完整拼版前按端点拒绝）
+    const hugeRangeBody = multipartBody({
+      text: { pages: '1-9007199254740991' },
+      files: [{ field: 'pdf', filename: 'sample.pdf', contentType: 'application/pdf', data: pdfBytes }],
+    }, boundary);
+    const hugeRangeResp = await request(server, 'POST', '/api/reprint', {
+      body: hugeRangeBody,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': hugeRangeBody.length,
+      },
+    });
+    assert.strictEqual(hugeRangeResp.status, 400);
+    assert.match(JSON.parse(hugeRangeResp.body.toString()).error, /超出原稿页码范围（1～5）/);
+
+    // 上述恶意输入被拒绝后服务未被阻塞：健康检查与合法补印仍即时响应
+    const healthAfterBad = await request(server, 'GET', '/api/health');
+    assert.strictEqual(healthAfterBad.status, 200);
+    const reprintAfterBad = await request(server, 'POST', '/api/reprint', {
+      body: reprintBody,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': reprintBody.length,
+      },
+    });
+    assert.strictEqual(reprintAfterBad.status, 200, '拒绝恶意页码后合法补印仍应正常');
+
     // 缺少文件 -> 400；非 PDF -> 400；损坏 PDF -> 422
     const reprintNoFileBody = multipartBody({ text: { pages: '2' } }, boundary);
     const reprintNoFile = await request(server, 'POST', '/api/reprint', {
@@ -954,7 +996,8 @@ function jsonRequest(server, urlPath, payload) {
     console.log('   批量校验 /api/preflight/batch：坏文件不阻断好文件、按代码汇总、缺文件/超 10 个 400、');
     console.log('   交付放行策略（自定义覆盖 200、非法策略 400）与逐文件/整批放行判定');
     console.log('   缺页补印 /api/reprint：命中定位与成对抽取 200、同张只补一次、分册偏移、');
-    console.log('   定位标记尺寸保留；空输入/格式错误/越界 400，缺文件/非 PDF 400，损坏 422');
+    console.log('   定位标记尺寸保留；空输入/格式错误/越界 400，缺文件/非 PDF 400，损坏 422；');
+    console.log('   非安全整数端点/超大区间及时 400 且不阻塞后续请求');
   } finally {
     server.close();
   }
