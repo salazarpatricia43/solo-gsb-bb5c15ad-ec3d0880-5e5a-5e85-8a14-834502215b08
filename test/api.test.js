@@ -902,6 +902,36 @@ function jsonRequest(server, urlPath, payload) {
     assert.strictEqual(outOfRangeResp.status, 400);
     assert.match(JSON.parse(outOfRangeResp.body.toString()).error, /超出原稿页码范围（1～5）/);
 
+    // 非安全整数页码（2^53 单点区间）：逐页递增无法前进，必须立即 400 而非卡死
+    const unsafePagesBody = multipartBody({
+      text: { pages: '9007199254740992-9007199254740992' },
+      files: [{ field: 'pdf', filename: 'sample.pdf', contentType: 'application/pdf', data: pdfBytes }],
+    }, boundary);
+    const unsafePagesResp = await request(server, 'POST', '/api/reprint', {
+      body: unsafePagesBody,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': unsafePagesBody.length,
+      },
+    });
+    assert.strictEqual(unsafePagesResp.status, 400);
+    assert.match(JSON.parse(unsafePagesResp.body.toString()).error, /超出可表示的页码上限/);
+
+    // 远超原稿页数的区间：在展开页码列表与完整拼版之前完成端点校验，及时 400
+    const hugeRangeBody = multipartBody({
+      text: { pages: '1-999999999' },
+      files: [{ field: 'pdf', filename: 'sample.pdf', contentType: 'application/pdf', data: pdfBytes }],
+    }, boundary);
+    const hugeRangeResp = await request(server, 'POST', '/api/reprint', {
+      body: hugeRangeBody,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': hugeRangeBody.length,
+      },
+    });
+    assert.strictEqual(hugeRangeResp.status, 400);
+    assert.match(JSON.parse(hugeRangeResp.body.toString()).error, /超出原稿页码范围（1～5）/);
+
     // 缺少文件 -> 400；非 PDF -> 400；损坏 PDF -> 422
     const reprintNoFileBody = multipartBody({ text: { pages: '2' } }, boundary);
     const reprintNoFile = await request(server, 'POST', '/api/reprint', {
@@ -954,7 +984,8 @@ function jsonRequest(server, urlPath, payload) {
     console.log('   批量校验 /api/preflight/batch：坏文件不阻断好文件、按代码汇总、缺文件/超 10 个 400、');
     console.log('   交付放行策略（自定义覆盖 200、非法策略 400）与逐文件/整批放行判定');
     console.log('   缺页补印 /api/reprint：命中定位与成对抽取 200、同张只补一次、分册偏移、');
-    console.log('   定位标记尺寸保留；空输入/格式错误/越界 400，缺文件/非 PDF 400，损坏 422');
+    console.log('   定位标记尺寸保留；空输入/格式错误/越界 400，缺文件/非 PDF 400，损坏 422；');
+    console.log('   非安全整数页码（2^53）与超大区间及时 400（不展开、不拼版）');
   } finally {
     server.close();
   }

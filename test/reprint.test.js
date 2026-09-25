@@ -8,6 +8,7 @@ const zlib = require('zlib');
 const { PDFDocument, PDFName, StandardFonts, rgb } = require('pdf-lib');
 const {
   ReprintInputError,
+  parseReprintPageRanges,
   parseReprintPagesSpec,
   parseReprintPages,
   buildReprintPlan,
@@ -54,7 +55,44 @@ for (const bad of ['0', '21', '0-3', '18-25', '2,99']) {
   );
 }
 
+// 重叠区间去重：并集展开后升序去重
+assert.deepStrictEqual(parseReprintPages('1-5,3-8', 20), [1, 2, 3, 4, 5, 6, 7, 8], '重叠区间按并集去重');
+assert.deepStrictEqual(parseReprintPages('5-6,1-3,2-4', 20), [1, 2, 3, 4, 5, 6], '多个重叠区间去重升序');
+
+// 非安全整数页码（>= 2^53）：逐页递增无法前进，必须在解析时拒绝而非死循环
+for (const bad of [
+  '9007199254740992-9007199254740992', // 2^53 单点区间（原死循环输入）
+  '9007199254740992',                 // 2^53 单页
+  '1-9007199254740992',               // 区间终点为 2^53
+  '9007199254740993-9007199254740994',
+  '99999999999999999999',
+]) {
+  assert.throws(
+    () => parseReprintPages(bad, 20),
+    (err) => err instanceof ReprintInputError && /超出可表示的页码上限/.test(err.message),
+    `非安全整数 ${JSON.stringify(bad)} 应报「超出可表示的页码上限」`,
+  );
+}
+
+// 安全整数但远超原稿页数的区间：端点越界校验在展开页码列表之前完成，
+// 不会展开出海量页码耗尽时间与内存（若先展开再校验，本用例会直接卡死/OOM）
+for (const bad of ['1-999999999', '21-100000000', '9007199254740991-9007199254740991']) {
+  assert.throws(
+    () => parseReprintPages(bad, 20),
+    (err) => err instanceof ReprintInputError && /超出原稿页码范围（1～20）/.test(err.message),
+    `超大区间 ${JSON.stringify(bad)} 应在展开前报「超出原稿页码范围」`,
+  );
+}
+
+// 区间解析：保持区间形态（不展开），单页为 from === to，全角分隔符按半角处理
+assert.deepStrictEqual(parseReprintPageRanges('2，5～7,9'), [
+  { from: 2, to: 2 },
+  { from: 5, to: 7 },
+  { from: 9, to: 9 },
+]);
+
 console.log('✅ 补印页码解析通过：空输入/格式错误/越界均有明确错误，合法表达式去重升序');
+console.log('✅ 无界展开防护通过：非安全整数页码即时报错，超大区间在展开前完成端点越界校验');
 
 // ---------- 2. 拼版方案中的印张定位 ----------
 // 2.1 整册 8 页：第1张 F[8|1] B[2|7]，第2张 F[6|3] B[4|5]
@@ -251,6 +289,25 @@ function decodePageContent(doc, pageIndex) {
     (err) => err instanceof ReprintInputError && /超出原稿页码范围（1～10）/.test(err.message),
   );
   console.log('✅ 补印错误处理通过：损坏 PDF、空输入、格式错误、越界页码分别给出明确错误');
+
+  // 3.5 无界展开防护：非法/越界输入在完整拼版之前拒绝（若先展开或先拼版，
+  // 下列用例会死循环、OOM 或明显拖慢；assert.rejects 本身即证明调用已及时返回）
+  await assert.rejects(
+    () => reprintPdf(srcBytes, {}, '9007199254740992-9007199254740992'),
+    (err) => err instanceof ReprintInputError && /超出可表示的页码上限/.test(err.message),
+    '2^53 单点区间应立即报输入错误而非死循环',
+  );
+  await assert.rejects(
+    () => reprintPdf(srcBytes, {}, '1-999999999'),
+    (err) => err instanceof ReprintInputError && /超出原稿页码范围（1～10）/.test(err.message),
+    '远超原稿页数的区间应在展开与拼版前报越界',
+  );
+  // 损坏 PDF + 越界区间：仍按原规则报 PDF 错误（页数读取在端点校验之前）
+  await assert.rejects(
+    () => reprintPdf(Buffer.from('%PDF-broken'), {}, '1-999999999'),
+    /不是有效的 PDF/,
+  );
+  console.log('✅ 补印无界展开防护通过：2^53 区间与超大区间在拼版前拒绝，损坏 PDF 报错规则不变');
 })().catch((err) => {
   console.error(err);
   process.exit(1);
